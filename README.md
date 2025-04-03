@@ -1,8 +1,8 @@
-# Sample Project: Data Engineering with Microsoft Fabric and Apache Spark
+# Data Engineering with Microsoft Fabric and Apache Spark
 
 ## Project Overview
 
-This sample project demonstrates the creation and management of scalable data pipelines in the microfinance domain using Microsoft Fabric's Spark runtime. It simulates realistic workloads such as customer onboarding, loan data tracking, data quality enforcement, and SCD Type 2 history management.
+This project demonstrates the creation and management of scalable data pipelines in the microfinance domain using Microsoft Fabric's Spark runtime. It simulates realistic workloads such as customer onboarding, loan data tracking, data quality enforcement, and SCD Type 2 history management.
 
 ## Project Structure
 
