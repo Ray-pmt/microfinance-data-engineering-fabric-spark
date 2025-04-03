@@ -1,0 +1,448 @@
+{
+  "name": "MicrofinanceIncrementalPipeline",
+  "properties": {
+    "description": "End-to-end incremental data pipeline for microfinance data processing",
+    "activities": [
+      {
+        "name": "GetWatermark",
+        "type": "LookupActivity",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.00:10:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "BinarySource",
+            "storeSettings": {
+              "type": "AzureBlobFSReadSettings",
+              "recursive": true,
+              "wildcardFileName": "watermark.json"
+            },
+            "formatSettings": {
+              "type": "JsonReadSettings"
+            }
+          },
+          "dataset": {
+            "referenceName": "WatermarkDataset",
+            "type": "DatasetReference"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "SetWatermarkVariables",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "GetWatermark",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:01:00",
+          "retry": 0
+        },
+        "typeProperties": {
+          "variableName": "lastProcessedDate",
+          "value": {
+            "value": "@activity('GetWatermark').output.lastProcessedDate",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "DataIngestion",
+        "type": "SparkJob",
+        "dependsOn": [
+          {
+            "activity": "SetWatermarkVariables",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "sparkJob": {
+            "referenceName": "data_ingestion",
+            "type": "SparkJobDefinitionReference"
+          },
+          "rootPath": "Files/scripts",
+          "entryFilePath": "data_ingestion.py",
+          "arguments": [
+            {
+              "name": "input_path",
+              "value": {
+                "value": "@pipeline().parameters.inputPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "output_path",
+              "value": {
+                "value": "@pipeline().parameters.ingestedDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "error_path",
+              "value": {
+                "value": "@pipeline().parameters.errorDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "incremental_mode",
+              "value": {
+                "value": "true",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "last_processed_date",
+              "value": {
+                "value": "@variables('lastProcessedDate')",
+                "type": "Expression"
+              }
+            }
+          ],
+          "sparkJobProperties": {
+            "className": "main",
+            "numExecutors": 2,
+            "executorCores": 4,
+            "executorMemory": "8g",
+            "driverMemory": "4g"
+          }
+        }
+      },
+      {
+        "name": "DataTransformation",
+        "type": "SparkJob",
+        "dependsOn": [
+          {
+            "activity": "DataIngestion",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "sparkJob": {
+            "referenceName": "data_transformation",
+            "type": "SparkJobDefinitionReference"
+          },
+          "rootPath": "Files/scripts",
+          "entryFilePath": "data_transformation.py",
+          "arguments": [
+            {
+              "name": "input_base_path",
+              "value": {
+                "value": "@pipeline().parameters.ingestedDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "output_base_path",
+              "value": {
+                "value": "@pipeline().parameters.transformedDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "incremental_mode",
+              "value": {
+                "value": "true",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "last_processed_date",
+              "value": {
+                "value": "@variables('lastProcessedDate')",
+                "type": "Expression"
+              }
+            }
+          ],
+          "sparkJobProperties": {
+            "className": "main",
+            "numExecutors": 3,
+            "executorCores": 4,
+            "executorMemory": "8g",
+            "driverMemory": "4g"
+          }
+        }
+      },
+      {
+        "name": "DataQualityChecks",
+        "type": "SparkJob",
+        "dependsOn": [
+          {
+            "activity": "DataTransformation",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "sparkJob": {
+            "referenceName": "data_quality_checks",
+            "type": "SparkJobDefinitionReference"
+          },
+          "rootPath": "Files/scripts",
+          "entryFilePath": "data_quality_checks.py",
+          "arguments": [
+            {
+              "name": "input_path",
+              "value": {
+                "value": "@pipeline().parameters.transformedDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "output_path",
+              "value": {
+                "value": "@pipeline().parameters.reportsPath",
+                "type": "Expression"
+              }
+            }
+          ],
+          "sparkJobProperties": {
+            "className": "main",
+            "numExecutors": 2,
+            "executorCores": 4,
+            "executorMemory": "8g",
+            "driverMemory": "4g"
+          }
+        }
+      },
+      {
+        "name": "SCDType2Handling",
+        "type": "SparkJob",
+        "dependsOn": [
+          {
+            "activity": "DataQualityChecks",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "sparkJob": {
+            "referenceName": "scd_type2_handling",
+            "type": "SparkJobDefinitionReference"
+          },
+          "rootPath": "Files/scripts",
+          "entryFilePath": "scd_type2_handling.py",
+          "arguments": [
+            {
+              "name": "new_data_path",
+              "value": {
+                "value": "@pipeline().parameters.transformedDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "dimension_path",
+              "value": {
+                "value": "@pipeline().parameters.dimensionDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "output_path",
+              "value": {
+                "value": "@pipeline().parameters.dimensionDataPath",
+                "type": "Expression"
+              }
+            }
+          ],
+          "sparkJobProperties": {
+            "className": "main",
+            "numExecutors": 2,
+            "executorCores": 4,
+            "executorMemory": "8g",
+            "driverMemory": "4g"
+          }
+        }
+      },
+      {
+        "name": "QualityCheckMonitoring",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "DataQualityChecks",
+            "dependencyConditions": [
+              "Completed"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.01:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "url": "https://api.example.com/notify",
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "pipelineId": "@pipeline().Pipeline",
+            "runId": "@pipeline().RunId",
+            "status": "@activity('DataQualityChecks').output.status",
+            "timestamp": "@utcnow()"
+          }
+        }
+      },
+      {
+        "name": "UpdateWatermark",
+        "type": "Copy",
+        "dependsOn": [
+          {
+            "activity": "SCDType2Handling",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "policy": {
+          "timeout": "0.01:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 30
+        },
+        "typeProperties": {
+          "source": {
+            "type": "JSONSource",
+            "storeSettings": {
+              "type": "AzureBlobFSReadSettings"
+            }
+          },
+          "sink": {
+            "type": "JSONSink",
+            "storeSettings": {
+              "type": "AzureBlobFSWriteSettings"
+            },
+            "formatSettings": {
+              "type": "JsonWriteSettings"
+            }
+          },
+          "enableStaging": false,
+          "translator": {
+            "type": "TabularTranslator",
+            "mappings": [
+              {
+                "source": {
+                  "path": "$['lastProcessedDate']"
+                },
+                "sink": {
+                  "path": "lastProcessedDate"
+                }
+              }
+            ],
+            "collectionReference": ""
+          }
+        },
+        "inputs": [
+          {
+            "referenceName": "NewWatermarkDataset",
+            "type": "DatasetReference",
+            "parameters": {
+              "lastProcessedDate": {
+                "value": "@utcnow()",
+                "type": "Expression"
+              }
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "referenceName": "WatermarkDataset",
+            "type": "DatasetReference"
+          }
+        ]
+      }
+    ],
+    "variables": {
+      "lastProcessedDate": {
+        "type": "String",
+        "defaultValue": "1900-01-01T00:00:00.000Z"
+      }
+    },
+    "parameters": {
+      "inputPath": {
+        "type": "String",
+        "defaultValue": "Files/raw_data/sample_data.csv"
+      },
+      "ingestedDataPath": {
+        "type": "String",
+        "defaultValue": "Files/fabric_ingested_data/parquet_data"
+      },
+      "errorDataPath": {
+        "type": "String",
+        "defaultValue": "Files/fabric_ingested_data/error_data"
+      },
+      "transformedDataPath": {
+        "type": "String",
+        "defaultValue": "Files/fabric_transformed_data"
+      },
+      "dimensionDataPath": {
+        "type": "String",
+        "defaultValue": "Files/fabric_dim_data"
+      },
+      "reportsPath": {
+        "type": "String",
+        "defaultValue": "Files/reports"
+      },
+      "watermarkPath": {
+        "type": "String",
+        "defaultValue": "Files/watermarks"
+      },
+      "incrementalLoad": {
+        "type": "Bool",
+        "defaultValue": true
+      }
+    },
+    "triggers": [
+      {
+        "name": "DailySchedule",
+        "type": "ScheduleTrigger",
+        "typeProperties": {
+          "recurrence": {
+            "frequency": "Day",
+            "interval": 1,
+            "startTime": "2023-01-01T01:00:00Z",
+            "timeZone": "UTC",
+            "schedule": {
+              "hours": [1],
+              "minutes": [0]
+            }
+          }
+        }
+      }
+    ]
+  }
+}
