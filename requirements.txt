@@ -1,0 +1,16 @@
+# Core dependencies
+pyspark==3.3.0
+delta-spark==2.3.0
+py4j==0.10.9.5
+
+# Testing
+pytest==7.3.1
+pytest-spark==0.6.0
+
+# Logging and monitoring
+python-json-logger==2.0.4
+
+# Optional - Microsoft Fabric connectors
+adlfs==2023.4.0
+azure-storage-blob==12.16.0
+azure-identity==1.13.0

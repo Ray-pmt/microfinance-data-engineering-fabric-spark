@@ -15,20 +15,22 @@ This project demonstrates the creation and management of scalable data pipelines
 │   └── sample_data.csv
 ├── data-pipeline-configuration
 │   └── fabric_spark_pipeline.json
+├── requirements.txt
+├── run_pipeline.sh
 ├── flowchart
 │   └── SCD_type2.drawio
 ├── scripts
 │   ├── data_ingestion.py
 │   ├── data_transformation.py
 │   ├── data_quality_checks.py
-│   └── scd_type2_handling.py  # Production-ready implementation
+│   └── scd_type2_handling.py
 ```
 
 ## Technologies Used
 - Microsoft Fabric (Spark Runtime)
 - PySpark
 - Delta Lake
-- JSON Notebook (Fabric-native)
+- Bash scripting (for pipeline orchestration)
 
 ## Core Capabilities
 
@@ -46,36 +48,44 @@ This project demonstrates the creation and management of scalable data pipelines
 - `scd_type2_handling.py` implements production-ready SCD Type 2 for tracking historical changes to customer and loan attributes
 - Features Delta Lake integration, robust error handling, optimized performance, and comprehensive monitoring
 - Configurable through notebook parameters in Microsoft Fabric
-- `SCD_type2.drawio` (in the `flowchart` folder) visually illustrates how historical changes are tracked over time.
 
 ## How to Run
 
-### Step 1: Environment Setup
+### Option 1: Shell Script (Recommended for Fabric)
+The shell script orchestrates the pipeline components in sequence:
+
 ```bash
-pip install pyspark delta-spark
+# Run with default parameters (dev environment)
+./run_pipeline.sh
+
+# Run with specific environment and date
+./run_pipeline.sh prod 2025-04-11
 ```
 
-### Step 2: Run Each Pipeline Component
+### Option 2: Manual Execution
 ```bash
-python scripts/data_ingestion.py
-python scripts/data_transformation.py
-python scripts/data_quality_checks.py
-python scripts/scd_type2_handling.py <new_data_path> <dimension_path> <output_path>
+python scripts/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_data fabric_ingested_data/error_data
+python scripts/data_quality_checks.py fabric_ingested_data/parquet_data fabric_data_quality_report.json
+python scripts/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data
+python scripts/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data
 ```
 
-### Step 3: Microsoft Fabric Notebook Execution
-- Import the SCD Type 2 script into a Fabric notebook
-- Configure parameters using notebook widgets
+### Option 3: Microsoft Fabric Execution
+- Import the pipeline configuration from `data-pipeline-configuration/fabric_spark_pipeline.json`
+- Configure parameters using Fabric's interface
 - Schedule execution using Fabric Pipelines
 
-## Microsoft Fabric Usage
-- The `.json` file under `data-pipeline-configuration/` is the exported notebook from Microsoft Fabric.
-- Open it in Fabric's workspace to execute via UI.
-- The SCD Type 2 implementation is optimized for Microsoft Fabric's Delta Lake integration and notebook environment.
-- Schedule execution using Fabric Pipelines.
+## Microsoft Fabric Integration
+- The pipeline is optimized for Microsoft Fabric's Delta Lake integration
+- Use Fabric's built-in scheduling and monitoring capabilities
+- Configure environment-specific parameters through Fabric's interface
+
+## Development and Testing
+- Use shell scripts for local development and testing
+- Run tests locally before deploying to Fabric
 
 ## Outcome
-- Version-controlled, production-ready PySpark pipelines designed for microfinance analytics
-- Robust SCD Type 2 implementation with Delta Lake for ACID transactions and data versioning
-- Compatible with Microsoft Fabric's Lakehouse and Notebook environment
-- Designed to be extensible for future integration into Azure DevOps or GitHub Actions workflows
+- Version-controlled, production-ready PySpark pipelines for microfinance analytics
+- Robust SCD Type 2 implementation with Delta Lake for ACID transactions
+- Compatible with Microsoft Fabric's Lakehouse environment
+- Pipeline orchestration using both Fabric's native tools and custom shell scripts
