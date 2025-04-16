@@ -1,4 +1,4 @@
-# Data Engineering with Microsoft Fabric and Apache Spark
+# Microfinance Data Engineering with Microsoft Fabric and Apache Spark
 
 ## Project Overview
 
@@ -7,7 +7,7 @@ This project demonstrates the creation and management of scalable data pipelines
 ## Project Structure
 
 ```
-/data-engineering-fabric-spark
+/microfinance-data-engineering-fabric-spark
 ├── README.md
 ├── LICENSE
 ├── .gitignore
