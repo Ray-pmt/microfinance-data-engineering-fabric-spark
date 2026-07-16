@@ -30,18 +30,18 @@ echo "Starting Microfinance pipeline for ${ENV} environment with data from ${PRO
 
 # Data Ingestion
 echo "Step 1: Data Ingestion"
-spark-submit ${CONFIG} scripts/data_ingestion.py ${INPUT_PATH} ${INGESTED_PATH} ${ERROR_PATH}
+spark-submit ${CONFIG} src/data_ingestion.py ${INPUT_PATH} ${INGESTED_PATH} ${ERROR_PATH}
 
 # Data Quality Checks
 echo "Step 2: Data Quality Checks"
-spark-submit ${CONFIG} scripts/data_quality_checks.py ${INGESTED_PATH} ${REPORTS_PATH}/quality_report.json
+spark-submit ${CONFIG} src/data_quality_checks.py ${INGESTED_PATH} ${REPORTS_PATH}/quality_report.json
 
 # Data Transformation
 echo "Step 3: Data Transformation"
-spark-submit ${CONFIG} scripts/data_transformation.py ${INGESTED_PATH} ${TRANSFORMED_PATH}
+spark-submit ${CONFIG} src/data_transformation.py ${INGESTED_PATH} ${TRANSFORMED_PATH}
 
 # SCD Type 2 Handling
 echo "Step 4: SCD Type 2 Processing"
-spark-submit ${CONFIG} scripts/scd_type2_handling.py ${TRANSFORMED_PATH} ${DIM_PATH} ${DIM_PATH}
+spark-submit ${CONFIG} src/scd_type2_handling.py ${TRANSFORMED_PATH} ${DIM_PATH} ${DIM_PATH}
 
 echo "Pipeline completed successfully"

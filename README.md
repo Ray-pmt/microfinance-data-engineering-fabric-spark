@@ -4,6 +4,10 @@
 
 This project demonstrates the creation and management of scalable data pipelines in the microfinance domain using Microsoft Fabric's Spark runtime. It simulates realistic workloads such as customer onboarding, loan data tracking, data quality enforcement, and SCD Type 2 history management.
 
+## Pipeline Architecture
+
+![Pipeline activities flowchart](docs/diagrams/ADF_activities_flowchart.png)
+
 ## Project Structure
 
 ```
@@ -11,19 +15,21 @@ This project demonstrates the creation and management of scalable data pipelines
 ├── README.md
 ├── LICENSE
 ├── .gitignore
-├── data
-│   └── sample_data.csv
-├── data-pipeline-configuration
-│   └── fabric_spark_pipeline.json
 ├── requirements.txt
-├── run_pipeline.sh
-├── flowchart
-│   └── SCD_type2.drawio
-├── scripts
+├── run_pipeline.sh              # Pipeline orchestration entry point
+├── src                          # PySpark pipeline components
 │   ├── data_ingestion.py
 │   ├── data_transformation.py
 │   ├── data_quality_checks.py
 │   └── scd_type2_handling.py
+├── config
+│   └── fabric_spark_pipeline.json   # Fabric pipeline definition
+├── data
+│   └── sample_data.csv          # Sample input data
+└── docs
+    └── diagrams
+        ├── ADF_activities_flowchart.png
+        └── SCD_type2.drawio
 ```
 
 ## Technologies Used
@@ -64,14 +70,14 @@ The shell script orchestrates the pipeline components in sequence:
 
 ### Option 2: Manual Execution
 ```bash
-python scripts/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_data fabric_ingested_data/error_data
-python scripts/data_quality_checks.py fabric_ingested_data/parquet_data fabric_data_quality_report.json
-python scripts/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data
-python scripts/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data
+python src/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_data fabric_ingested_data/error_data
+python src/data_quality_checks.py fabric_ingested_data/parquet_data fabric_data_quality_report.json
+python src/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data
+python src/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data
 ```
 
 ### Option 3: Microsoft Fabric Execution
-- Import the pipeline configuration from `data-pipeline-configuration/fabric_spark_pipeline.json`
+- Import the pipeline configuration from `config/fabric_spark_pipeline.json`
 - Configure parameters using Fabric's interface
 - Schedule execution using Fabric Pipelines
 
