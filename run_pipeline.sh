@@ -1,13 +1,15 @@
 #!/bin/bash
 
 # Microfinance Data Pipeline Execution Script
-# Usage: ./run_pipeline.sh [environment] [date]
+# Usage: ./run_pipeline.sh [environment] [date] [scd_type]
+#   scd_type: 2 (default) = in-table row versioning | 4 = current + history tables
 
 set -e
 
 # Default parameters
 ENV=${1:-"dev"}
 PROCESS_DATE=${2:-$(date +%Y-%m-%d)}
+SCD_TYPE=${3:-"2"}
 
 # Config based on environment
 if [ "$ENV" == "prod" ]; then
@@ -40,8 +42,13 @@ spark-submit ${CONFIG} src/data_quality_checks.py ${INGESTED_PATH} ${REPORTS_PAT
 echo "Step 3: Data Transformation"
 spark-submit ${CONFIG} src/data_transformation.py ${INGESTED_PATH} ${TRANSFORMED_PATH}
 
-# SCD Type 2 Handling
-echo "Step 4: SCD Type 2 Processing"
-spark-submit ${CONFIG} src/scd_type2_handling.py ${TRANSFORMED_PATH} ${DIM_PATH} ${DIM_PATH}
+# Slowly Changing Dimension Handling
+if [ "$SCD_TYPE" == "4" ]; then
+  echo "Step 4: SCD Type 4 Processing (current + history tables)"
+  spark-submit ${CONFIG} src/scd_type4_handling.py ${TRANSFORMED_PATH} ${DIM_PATH}/current ${DIM_PATH}/history
+else
+  echo "Step 4: SCD Type 2 Processing (in-table row versioning)"
+  spark-submit ${CONFIG} src/scd_type2_handling.py ${TRANSFORMED_PATH} ${DIM_PATH} ${DIM_PATH}
+fi
 
 echo "Pipeline completed successfully"

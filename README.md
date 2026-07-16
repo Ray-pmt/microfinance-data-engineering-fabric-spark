@@ -21,7 +21,8 @@ This project demonstrates the creation and management of scalable data pipelines
 │   ├── data_ingestion.py
 │   ├── data_transformation.py
 │   ├── data_quality_checks.py
-│   └── scd_type2_handling.py
+│   ├── scd_type2_handling.py
+│   └── scd_type4_handling.py
 ├── config
 │   └── fabric_spark_pipeline.json   # Fabric pipeline definition
 ├── data
@@ -29,7 +30,8 @@ This project demonstrates the creation and management of scalable data pipelines
 └── docs
     └── diagrams
         ├── ADF_activities_flowchart.png
-        └── SCD_type2.drawio
+        ├── SCD_type2.drawio
+        └── SCD_type4.drawio
 ```
 
 ## Technologies Used
@@ -55,17 +57,34 @@ This project demonstrates the creation and management of scalable data pipelines
 - Features Delta Lake integration, robust error handling, optimized performance, and comprehensive monitoring
 - Configurable through notebook parameters in Microsoft Fabric
 
+### 🔹 SCD Type 4
+- `scd_type4_handling.py` implements the alternative history-table pattern: a compact *current* table (one row per business key) plus an append-only *history* table of superseded versions
+- Shares the same dimension configs (customer, loan) and change-detection logic as the Type 2 module, so the two strategies are directly comparable
+- Selectable at run time via the pipeline's `scd_type` parameter
+
+**Choosing between Type 2 and Type 4:**
+
+| | SCD Type 2 (in-table versioning) | SCD Type 4 (current + history tables) |
+|---|---|---|
+| Storage | One table with `effective_start/end_date`, `is_current` | `dim_*_current` + `dim_*_history` |
+| Serving queries | Must filter `is_current = true` | Hit the small current table directly |
+| Point-in-time joins | Natural (date-range join in one table) | Query the history table |
+| Best when | History is queried as often as current state | Dashboards mostly need latest state; history is audit/compliance |
+
 ## How to Run
 
 ### Option 1: Shell Script (Recommended for Fabric)
 The shell script orchestrates the pipeline components in sequence:
 
 ```bash
-# Run with default parameters (dev environment)
+# Run with default parameters (dev environment, SCD Type 2)
 ./run_pipeline.sh
 
 # Run with specific environment and date
 ./run_pipeline.sh prod 2025-04-11
+
+# Run with SCD Type 4 (current + history tables) instead of Type 2
+./run_pipeline.sh dev 2025-04-11 4
 ```
 
 ### Option 2: Manual Execution
@@ -74,6 +93,9 @@ python src/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_d
 python src/data_quality_checks.py fabric_ingested_data/parquet_data fabric_data_quality_report.json
 python src/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data
 python src/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data
+
+# Or SCD Type 4 (writes dim_*_current and dim_*_history tables)
+python src/scd_type4_handling.py fabric_transformed_data/parquet_data fabric_dim_data/current fabric_dim_data/history
 ```
 
 ### Option 3: Microsoft Fabric Execution
