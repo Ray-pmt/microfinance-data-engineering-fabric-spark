@@ -42,16 +42,24 @@ def make_row():
 
 
 @pytest.fixture
-def write_batch(spark, tmp_path):
-    """Write a batch of transformed rows to a fresh Parquet path and return the path."""
-    counter = {"n": 0}
+def transformed_path(tmp_path):
+    return str(tmp_path / "transformed")
 
-    def _write(rows):
-        counter["n"] += 1
-        path = str(tmp_path / f"batch_{counter['n']}")
+
+@pytest.fixture
+def write_batch(spark, transformed_path):
+    """
+    Write one process_date batch of transformed rows into the shared transformed table
+    (replacing that date's partition, as data_transformation.py does) and return the table path.
+    """
+    def _write(rows, process_date):
         spark.createDataFrame(rows, TRANSFORMED_SCHEMA) \
              .withColumn("last_updated", F.to_timestamp("last_updated")) \
-             .write.parquet(path)
-        return path
+             .withColumn("process_date", F.lit(process_date).cast("date")) \
+             .write.mode("overwrite") \
+             .option("partitionOverwriteMode", "dynamic") \
+             .partitionBy("process_date") \
+             .parquet(transformed_path)
+        return transformed_path
 
     return _write

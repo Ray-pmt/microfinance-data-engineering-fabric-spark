@@ -18,6 +18,8 @@ import json
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from common import read_batch, delete_path
+
 # Configure minimal logging (Fabric typically provides integrated logging)
 logging.basicConfig(
     level=logging.INFO,
@@ -84,25 +86,25 @@ def check_quality(spark, input_path: str, output_report: str, process_date: str 
     logger.info(f"Starting data quality checks on data from {input_path} (process_date={process_date})")
 
     # Read the ingested Parquet data.
-    df = spark.read.parquet(input_path)
-    if process_date:
-        df = df.filter(F.col("process_date") == F.lit(process_date).cast("date"))
-    record_count = df.count()
+    df = read_batch(spark, input_path, process_date)
+    record_count = df.count() if df is not None else 0
     logger.info(f"Loaded {record_count} records from {input_path}")
 
-    if record_count == 0:
-        logger.info("No data available for quality checks. Exiting.")
-        return {}
-
-    # Run quality validations.
-    error_records, metrics = run_quality_checks(df)
-    error_count = error_records.count()
-    logger.info(f"Quality checks completed. Found {error_count} records with issues.")
-
-    # Always overwrite so a clean run doesn't leave a previous run's errors behind.
     error_output_path = errors_output_path(output_report)
-    error_records.write.mode("overwrite").parquet(error_output_path)
-    logger.info(f"Error records written to {error_output_path}")
+    if record_count == 0:
+        # Still write a report, and drop a previous run's error records, so nothing stale is left behind
+        logger.info("No data available for quality checks.")
+        error_count, metrics = 0, {}
+        delete_path(spark, error_output_path)
+    else:
+        # Run quality validations.
+        error_records, metrics = run_quality_checks(df)
+        error_count = error_records.count()
+        logger.info(f"Quality checks completed. Found {error_count} records with issues.")
+
+        # Always overwrite so a clean run doesn't leave a previous run's errors behind.
+        error_records.write.mode("overwrite").parquet(error_output_path)
+        logger.info(f"Error records written to {error_output_path}")
 
     # Prepare and write the quality report.
     quality_report = {

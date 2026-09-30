@@ -87,3 +87,78 @@ def test_quality_report_is_written_to_a_new_directory(spark, tmp_path):
     assert report["error_records"] == 0
     written = json.loads("\n".join(r["value"] for r in spark.read.text(report_path).collect()))
     assert written["metrics"]["invalid_status"]["error_count"] == 0
+
+
+def _count_for(spark, path, process_date):
+    return spark.read.parquet(path).filter(F.col("process_date") == process_date).count()
+
+
+def test_ingestion_rerun_clears_partitions_that_become_empty(spark, tmp_path):
+    out, err = str(tmp_path / "ingested"), str(tmp_path / "errors")
+    # Another date that must never be touched
+    ingest(spark, _write_csv(tmp_path, [VALID, INVALID_STATUS], "other.csv"), out, err, "2025-01-19")
+
+    ingest(spark, _write_csv(tmp_path, [VALID, INVALID_STATUS], "v1.csv"), out, err, "2025-01-20")
+    assert _count_for(spark, out, "2025-01-20") == 1
+    assert _count_for(spark, err, "2025-01-20") == 1
+
+    # Corrected file: every row is now valid -> the old error rows for the date must go
+    ingest(spark, _write_csv(tmp_path, [VALID], "v2.csv"), out, err, "2025-01-20")
+    assert _count_for(spark, out, "2025-01-20") == 1
+    assert _count_for(spark, err, "2025-01-20") == 0
+
+    # Every row invalid -> the old valid rows for the date must go
+    ingest(spark, _write_csv(tmp_path, [INVALID_STATUS], "v3.csv"), out, err, "2025-01-20")
+    assert _count_for(spark, out, "2025-01-20") == 0
+    assert _count_for(spark, err, "2025-01-20") == 1
+
+    # Empty file -> both are cleared
+    counts = ingest(spark, _write_csv(tmp_path, [], "v4.csv"), out, err, "2025-01-20")
+    assert counts == {"total": 0, "valid": 0, "errors": 0}
+    assert _count_for(spark, out, "2025-01-20") == 0
+    assert _count_for(spark, err, "2025-01-20") == 0
+
+    assert _count_for(spark, out, "2025-01-19") == 1
+    assert _count_for(spark, err, "2025-01-19") == 1
+
+
+def test_first_batch_with_no_valid_rows_does_not_break_downstream(spark, tmp_path):
+    out, err = str(tmp_path / "ingested"), str(tmp_path / "errors")
+    ingest(spark, _write_csv(tmp_path, [INVALID_STATUS]), out, err, "2025-01-20")
+
+    assert transform_data(spark, out, str(tmp_path / "transformed"), "2025-01-20") == 0
+    assert check_quality(spark, out, str(tmp_path / "report.json"), "2025-01-20")["total_records"] == 0
+
+
+def test_transformation_rerun_clears_a_batch_that_became_empty(spark, tmp_path):
+    ingested, err, transformed = str(tmp_path / "ingested"), str(tmp_path / "errors"), str(tmp_path / "transformed")
+    ingest(spark, _write_csv(tmp_path, [VALID], "v1.csv"), ingested, err, "2025-01-19")
+    ingest(spark, _write_csv(tmp_path, [VALID], "v2.csv"), ingested, err, "2025-01-20")
+    transform_data(spark, ingested, transformed, "2025-01-19")
+    transform_data(spark, ingested, transformed, "2025-01-20")
+
+    ingest(spark, _write_csv(tmp_path, [INVALID_STATUS], "v3.csv"), ingested, err, "2025-01-20")
+    assert transform_data(spark, ingested, transformed, "2025-01-20") == 0
+
+    assert _count_for(spark, transformed, "2025-01-20") == 0
+    assert _count_for(spark, transformed, "2025-01-19") == 1
+
+
+def test_quality_rerun_on_empty_batch_replaces_report_and_errors(spark, tmp_path):
+    ingested, err = str(tmp_path / "ingested"), str(tmp_path / "errors")
+    report_path = str(tmp_path / "reports" / "quality_report.json")
+    ingest(spark, _write_csv(tmp_path, [VALID], "v1.csv"), ingested, err, "2025-01-20")
+    check_quality(spark, ingested, report_path, "2025-01-20")
+    assert (tmp_path / "reports" / "quality_report_errors.parquet").exists()
+
+    ingest(spark, _write_csv(tmp_path, [], "v2.csv"), ingested, err, "2025-01-20")
+    check_quality(spark, ingested, report_path, "2025-01-20")
+
+    written = json.loads("\n".join(r["value"] for r in spark.read.text(report_path).collect()))
+    assert written["total_records"] == 0
+    assert not (tmp_path / "reports" / "quality_report_errors.parquet").exists()
+
+
+def test_steps_fail_on_a_missing_input_table(spark, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        transform_data(spark, str(tmp_path / "nope"), str(tmp_path / "out"), "2025-01-20")

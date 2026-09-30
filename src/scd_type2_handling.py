@@ -3,12 +3,15 @@
 SCD Type 2 Handling Script for Microfinance Dimensions on Microsoft Fabric
 
 Features:
+- Processes one process_date batch at a time, using that date as the effective date;
+  refuses to apply a batch older than what the dimension already reflects
 - Reads new data once and reuses it for each dimension (improves efficiency)
 - Keeps the latest version of each business key (by last_updated) from the incoming data
 - Only keys present in the incoming data can be expired; keys absent from a batch stay current
 - Null-safe change detection on the tracked columns
 - The dimension is rewritten via a staging directory, so reading and replacing the same
-  path is safe (a plain overwrite would delete the files the plan is still reading)
+  path is safe (a plain overwrite would delete the files the plan is still reading);
+  an interrupted swap is recovered on the next run instead of looking like a missing table
 - Errors propagate (non-zero exit) instead of being logged and skipped
 """
 
@@ -19,7 +22,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-from common import DIMENSION_CONFIGS, latest_per_key, tracked_columns_changed, path_exists, overwrite_parquet
+from common import (DIMENSION_CONFIGS, latest_per_key, tracked_columns_changed, path_exists,
+                    overwrite_parquet, read_batch, recover_table)
 
 # Configure logging
 logging.basicConfig(
@@ -42,25 +46,30 @@ def _add_current_versions(df, business_keys, first_key, effective_date):
              .withColumn("is_current", F.lit(True))
 
 
-def apply_scd_type2(spark, new_data_path, dimension_path, output_path, effective_date=None):
+def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_date=None):
     """
     Apply SCD Type 2 processing to dimension tables.
 
     Args:
         spark: SparkSession
-        new_data_path: Path to the new transformed data (read once for efficiency)
+        new_data_path: Path to the transformed data (partitioned by process_date)
         dimension_path: Base path for existing dimension tables
         output_path: Path to write updated dimension tables (may be the same as dimension_path)
-        effective_date: Date (YYYY-MM-DD) stamped on new/expired versions; defaults to today
+        process_date: Batch (YYYY-MM-DD) to apply; also stamped as the effective date on
+            new/expired versions. When omitted, all batches are read and today is used.
     """
-    effective_date = effective_date or date.today().isoformat()
+    effective_date = process_date or date.today().isoformat()
     logger.info(
         f"Starting SCD Type 2 processing: new_data_path={new_data_path}, "
-        f"dimension_path={dimension_path}, effective_date={effective_date}"
+        f"dimension_path={dimension_path}, process_date={process_date}, effective_date={effective_date}"
     )
 
-    # Read and cache new data once for reuse
-    new_data_full = spark.read.parquet(new_data_path).cache()
+    # Read and cache this batch once for reuse
+    new_data_full = read_batch(spark, new_data_path, process_date)
+    if new_data_full is None:
+        logger.info(f"No transformed data for process_date={process_date}; dimensions left as is.")
+        return
+    new_data_full = new_data_full.cache()
     logger.info(f"Loaded new data with {new_data_full.count()} records")
 
     for dim_name, config in DIMENSION_CONFIGS.items():
@@ -76,6 +85,11 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, effective
         dim_file_path = f"{dimension_path}/{dim_name}"
         target_path = f"{output_path}/{dim_name}"
 
+        # Finish or roll back an interrupted swap first, so it isn't mistaken for a missing table
+        recover_table(spark, dim_file_path)
+        if target_path != dim_file_path:
+            recover_table(spark, target_path)
+
         # Initial load: every key becomes the first current version
         if not path_exists(spark, dim_file_path):
             logger.info(f"{dim_name}: Dimension does not exist yet. Creating it.")
@@ -90,6 +104,16 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, effective
         if missing_cols:
             raise ValueError(f"{dim_name}: existing dimension at {dim_file_path} is missing columns {missing_cols}")
         dim_df = dim_df.select(*all_columns, *SCD2_COLUMNS)
+
+        # Versions must be applied in date order; an older batch would be recorded as a change
+        # after newer versions, with an effective date earlier than theirs
+        latest_effective_date = dim_df.agg(F.max("effective_start_date")).collect()[0][0]
+        if latest_effective_date and effective_date < latest_effective_date:
+            raise ValueError(
+                f"{dim_name}: already reflects changes effective {latest_effective_date}; applying the "
+                f"{effective_date} batch now would corrupt its history. Rebuild the dimension by "
+                f"replaying batches in date order instead."
+            )
 
         current_records = dim_df.filter(F.col("is_current"))
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
@@ -136,18 +160,18 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, effective
 
 def main():
     if len(sys.argv) < 4:
-        logger.error("Usage: scd_type2_handling.py <new_data_path> <dimension_path> <output_path> [effective_date]")
+        logger.error("Usage: scd_type2_handling.py <new_data_path> <dimension_path> <output_path> [process_date]")
         sys.exit(1)
 
     new_data_path = sys.argv[1]
     dimension_path = sys.argv[2]
     output_path = sys.argv[3]
-    effective_date = sys.argv[4] if len(sys.argv) > 4 else None
+    process_date = sys.argv[4] if len(sys.argv) > 4 else None
 
     spark = SparkSession.builder.appName("MicrofinanceSCDType2").getOrCreate()
 
     try:
-        apply_scd_type2(spark, new_data_path, dimension_path, output_path, effective_date)
+        apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_date)
     except Exception as e:
         logger.error(f"SCD Type 2 processing failed: {str(e)}", exc_info=True)
         sys.exit(1)

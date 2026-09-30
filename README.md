@@ -59,11 +59,12 @@ This project demonstrates the creation and management of scalable data pipelines
 ### 🔹 SCD Type 2
 - `scd_type2_handling.py` implements SCD Type 2 for tracking historical changes to customer and loan attributes
 - Takes the latest version of each key (by `last_updated`), uses null-safe change detection, and only expires keys present in the incoming batch
-- Rewrites the dimension through a staging directory, so reading and replacing the same path is safe
+- Rewrites the dimension through a staging directory, so reading and replacing the same path is safe, and recovers an interrupted swap on the next run
 
 ### 🔹 SCD Type 4
 - `scd_type4_handling.py` implements the alternative history-table pattern: a compact *current* table (one row per business key) plus an append-only *history* table of superseded versions
 - Shares the same dimension configs (customer, loan) and change-detection logic as the Type 2 module, so the two strategies are directly comparable
+- History appends skip versions that are already archived, so retrying a failed run doesn't duplicate history
 - Selectable at run time via the pipeline's `scd_type` parameter
 
 **Choosing between Type 2 and Type 4:**
@@ -91,7 +92,11 @@ The shell script orchestrates the pipeline components in sequence:
 ./run_pipeline.sh dev 2025-04-11 4
 ```
 
-The date is the batch's `process_date`. Re-running a date replaces that batch, and the date is also used as the SCD effective date. Any failing step exits non-zero, which stops the script.
+The date is the batch's `process_date`. Every step works on that batch only:
+- Ingestion, transformation and data quality replace that date's output on a re-run, including clearing it when the re-run has no rows for it.
+- The SCD step applies only that date's transformed batch, using the date as the effective date. Dimensions must be built in date order: re-running the latest date is safe, but applying a date older than the dimension already reflects is refused, since it would corrupt the history.
+
+Any failing step exits non-zero, which stops the script. Dimension tables are replaced by writing a staging copy and swapping it in, keeping the previous version until the swap completes; the next run recovers an interrupted swap automatically.
 
 ### Option 2: Manual Execution
 ```bash
@@ -122,7 +127,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-The tests cover schema enforcement and error routing, re-run idempotency, failure propagation, and the SCD Type 2 / Type 4 cases that matter (changed, new, and absent keys; latest-version-wins; null-to-value changes).
+The tests cover schema enforcement and error routing, re-run idempotency, failure propagation, and the SCD Type 2 / Type 4 cases that matter (changed, new, and absent keys; latest-version-wins; null-to-value changes; one batch per date and date-order enforcement; recovery from an interrupted table swap or a failed run).
 
 ## Outcome
 - Version-controlled, production-ready PySpark pipelines for microfinance analytics

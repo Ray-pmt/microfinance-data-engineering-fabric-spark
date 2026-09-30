@@ -5,7 +5,8 @@ A streamlined data transformation script for a microfinance company on Microsoft
 Features:
 - Calculation of monthly loan payments using standard amortization formula
 - Categorization of loans based on amount
-- Idempotent writes: each run replaces only the process_date partitions it transforms
+- Idempotent writes: each run replaces only the process_date partitions it transforms,
+  including clearing a batch that has become empty
 - Audit log kept outside the data directory so it never breaks reads of the table
 - Failures propagate (non-zero exit) so the orchestrator can see them
 """
@@ -16,6 +17,8 @@ import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
+
+from common import read_batch, write_batch_partition
 
 # Configure minimal logging (Fabric provides integrated monitoring)
 logging.basicConfig(
@@ -65,14 +68,16 @@ def transform_data(spark, input_path: str, output_path: str, process_date: str =
     logger.info(f"Starting data transformation from {input_path} to {output_path} (process_date={process_date})")
 
     # Read the ingested data (Parquet, partitioned by process_date)
-    df = spark.read.parquet(input_path)
-    if process_date:
-        df = df.filter(F.col("process_date") == F.lit(process_date).cast("date"))
-    total_records = df.count()
+    df = read_batch(spark, input_path, process_date)
+    total_records = df.count() if df is not None else 0
     logger.info(f"Loaded {total_records} records from {input_path}")
 
     if total_records == 0:
-        logger.info("No data to transform. Exiting.")
+        if process_date:
+            logger.info(f"No data for {process_date}; clearing any previous output for it.")
+            write_batch_partition(spark, None, 0, output_path, process_date)
+        else:
+            logger.info("No data to transform. Exiting.")
         return 0
 
     # Calculate monthly payment and add as a new column.
@@ -96,10 +101,7 @@ def transform_data(spark, input_path: str, output_path: str, process_date: str =
 
     # Replace only the process_date partitions present in this run, so re-runs don't duplicate rows
     logger.info("Writing transformed data.")
-    df.write.mode("overwrite") \
-      .option("partitionOverwriteMode", "dynamic") \
-      .partitionBy("process_date") \
-      .parquet(output_path)
+    write_batch_partition(spark, df, total_records, output_path, process_date)
 
     # Append a record of this run to the audit log.
     audit_data = {

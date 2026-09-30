@@ -5,7 +5,8 @@ Simplified data ingestion script for a microfinance company on Microsoft Fabric.
 Features:
 - Schema enforcement (malformed rows are captured, not silently nulled)
 - Data validation with invalid rows written to an error path
-- Idempotent writes: each run replaces only its own process_date partition
+- Idempotent writes: each run replaces only its own process_date partition,
+  including clearing it when a re-run has no rows for it
 - Failures propagate (non-zero exit) so the orchestrator can see them
 """
 
@@ -15,6 +16,8 @@ from datetime import date
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, TimestampType, DateType
+
+from common import write_batch_partition
 
 # Configure logging (Fabric provides integrated monitoring, so this is minimal)
 logging.basicConfig(
@@ -82,9 +85,9 @@ def ingest(spark: SparkSession, input_path: str, output_path: str, error_path: s
     """
     Ingest one batch of raw CSV data.
 
-    Valid and error records are both partitioned by `process_date` and written with dynamic
-    partition overwrite, so re-running the same process_date replaces that batch instead of
-    appending a duplicate copy of it.
+    Valid and error records are both partitioned by `process_date`. Re-running the same
+    process_date replaces that batch in both tables; a table that gets no rows on the re-run
+    has the batch's old partition removed.
 
     Returns a dict with the total, valid and error record counts.
     """
@@ -102,33 +105,26 @@ def ingest(spark: SparkSession, input_path: str, output_path: str, error_path: s
     total_count = df.count()
     logger.info(f"Loaded {total_count} records from {input_path}")
 
-    if total_count == 0:
-        logger.info("No data found. Exiting ingestion.")
-        return {"total": 0, "valid": 0, "errors": 0}
-
     valid_records, error_records = validate_data(df)
     valid_count = valid_records.count()
     error_count = error_records.count()
     logger.info(f"Data validation completed: {valid_count} valid records, {error_count} errors.")
 
-    # Write valid records; only this batch's partition is replaced
-    if valid_count > 0:
-        logger.info(f"Writing {valid_count} valid records to {output_path}")
-        valid_records.drop(CORRUPT_RECORD_COLUMN) \
-                     .withColumn("ingestion_timestamp", F.current_timestamp()) \
-                     .write.mode("overwrite") \
-                     .option("partitionOverwriteMode", "dynamic") \
-                     .partitionBy("process_date") \
-                     .parquet(output_path)
+    # Replace this batch's partitions (clearing them when there are no rows for them)
+    logger.info(f"Writing {valid_count} valid records to {output_path}")
+    write_batch_partition(
+        spark,
+        valid_records.drop(CORRUPT_RECORD_COLUMN).withColumn("ingestion_timestamp", F.current_timestamp()),
+        valid_count, output_path, process_date,
+    )
 
-    # Write error records for later review
     if error_count > 0:
         logger.warning(f"Writing {error_count} error records to {error_path}")
-        error_records.withColumn("error_timestamp", F.current_timestamp()) \
-                     .write.mode("overwrite") \
-                     .option("partitionOverwriteMode", "dynamic") \
-                     .partitionBy("process_date") \
-                     .parquet(error_path)
+    write_batch_partition(
+        spark,
+        error_records.withColumn("error_timestamp", F.current_timestamp()),
+        error_count, error_path, process_date,
+    )
 
     df.unpersist()
     logger.info("Data ingestion completed successfully.")
