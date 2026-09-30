@@ -13,7 +13,8 @@ effective dates and is_current flags) so the pipeline demonstrates both patterns
 
 Features:
 - Processes one process_date batch at a time, using that date as the effective date;
-  records the latest batch applied (even one with no changes) and refuses older batches
+  records the latest batch applied (even one with no changes) and refuses older batches;
+  a re-run of the latest batch is allowed only if it changes nothing (corrections need a replay)
 - Reads new data once and reuses it for each dimension (improves efficiency)
 - Config-driven dimensions sharing the same business keys / tracked columns as SCD Type 2
 - Keeps the latest version of each business key (by last_updated) from the incoming data
@@ -32,7 +33,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from common import (DIMENSION_CONFIGS, latest_per_key, tracked_columns_changed, path_exists,
-                    overwrite_parquet, read_batch, recover_table, check_batch_order, write_watermark)
+                    overwrite_parquet, read_batch, recover_table, check_batch_order, check_rerun_unchanged,
+                    write_watermark)
 
 # Configure logging
 logging.basicConfig(
@@ -106,7 +108,7 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
 
         # Batches must be applied in date order
         latest_change_date = current_df.agg(F.max("record_effective_date")).collect()[0][0]
-        check_batch_order(spark, dim_name, current_table_path, effective_date, latest_change_date)
+        cutoff = check_batch_order(spark, dim_name, current_table_path, effective_date, latest_change_date)
 
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
 
@@ -121,6 +123,7 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         changed_count = changed_records.count()
         new_count = new_records.count()
         logger.info(f"{dim_name}: Found {changed_count} changed records and {new_count} new records.")
+        check_rerun_unchanged(dim_name, effective_date, cutoff, changed_count + new_count)
 
         if changed_count == 0 and new_count == 0:
             logger.info(f"{dim_name}: No changes; tables left as is.")

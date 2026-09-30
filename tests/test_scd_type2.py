@@ -227,3 +227,56 @@ def test_interrupted_swap_is_recovered_even_when_the_batch_is_empty(spark, tmp_p
 
     assert spark.read.parquet(table).count() == 1
     assert not (tmp_path / "dim" / "dim_customer__previous").exists()
+
+
+def test_corrected_rerun_of_the_latest_date_is_refused(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    batches = write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+    before = sorted(tuple(r) for r in spark.read.parquet(f"{dim_path}/dim_customer").collect())
+
+    # February's batch is corrected: C instead of B
+    write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
+    with pytest.raises(ValueError, match="already been applied"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    # Nothing written: no version that starts and ends on 2025-02-01
+    after = sorted(tuple(r) for r in spark.read.parquet(f"{dim_path}/dim_customer").collect())
+    assert before == after
+
+
+def test_rerun_of_the_latest_date_that_adds_a_key_is_refused(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1")], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+
+    write_batch([make_row("C1", "L1"), make_row("C2", "L2")], "2025-01-01")
+    with pytest.raises(ValueError, match="already been applied"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+
+    assert spark.read.parquet(f"{dim_path}/dim_customer").count() == 1
+
+
+def test_replay_applies_a_corrected_batch(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    batches = write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+    write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
+
+    # Replay as the error message describes: drop the table and its watermark, run dates in order
+    for dim_name in ("dim_customer", "dim_loan"):
+        shutil.rmtree(f"{dim_path}/{dim_name}")
+        shutil.rmtree(f"{dim_path}/{dim_name}__watermark")
+    for process_date in ("2025-01-01", "2025-02-01"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date=process_date)
+
+    customers = _customers(spark, dim_path)
+    assert len(customers) == 2
+    assert customers[("C1", False)]["annual_income"] == 1000.0
+    assert customers[("C1", False)]["effective_end_date"] == "2025-02-01"
+    assert customers[("C1", True)]["annual_income"] == 3000.0
+    assert customers[("C1", True)]["effective_start_date"] == "2025-02-01"

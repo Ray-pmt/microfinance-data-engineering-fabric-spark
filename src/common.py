@@ -217,7 +217,9 @@ def check_batch_order(spark: SparkSession, table_name: str, table_path: str,
     of newer ones, with an earlier effective date. The cutoff is the latest batch applied
     (the watermark, which also covers batches that changed nothing) or, should the watermark
     lag behind (a crash between writing the table and the watermark), the latest change date.
-    Re-applying the latest batch date is allowed.
+    Re-applying the latest batch date is allowed (see `check_rerun_unchanged`).
+
+    Returns the cutoff date (None when nothing has been applied yet).
     """
     cutoff = max(filter(None, [read_watermark(spark, table_path), latest_change_date]), default=None)
     if cutoff and effective_date < cutoff:
@@ -225,4 +227,21 @@ def check_batch_order(spark: SparkSession, table_name: str, table_path: str,
             f"{table_name}: batches up to {cutoff} have already been applied; applying the "
             f"{effective_date} batch now would corrupt its history. Rebuild the table by "
             f"replaying batches in date order instead."
+        )
+    return cutoff
+
+
+def check_rerun_unchanged(table_name: str, effective_date: str, cutoff: str, change_count: int):
+    """
+    Refuse a re-run of the latest applied batch date when it would change the table.
+
+    A re-run that matches what was applied (e.g. a retry after a crash) is a no-op and is allowed.
+    A re-run with corrected data would be recorded as a second change on the same date: a version
+    that starts and ends on that date. Corrections to an applied batch need a replay instead.
+    """
+    if cutoff and effective_date == cutoff and change_count > 0:
+        raise ValueError(
+            f"{table_name}: the {effective_date} batch has already been applied and this re-run would "
+            f"change {change_count} record(s). Applied batches can't be corrected in place; replay the "
+            f"table: delete it and its __watermark, then run each batch date in order."
         )

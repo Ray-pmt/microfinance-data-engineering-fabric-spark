@@ -132,3 +132,23 @@ def test_interrupted_swap_is_recovered_even_when_the_batch_is_empty(spark, tmp_p
 
     assert spark.read.parquet(table).count() == 1
     assert not path_exists(spark, table + "__previous")
+
+
+def test_corrected_rerun_of_the_latest_date_is_refused(spark, tmp_path, write_batch, make_row):
+    current_path, history_path = str(tmp_path / "current"), str(tmp_path / "history")
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    batches = write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-01-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    # February's batch is corrected: C instead of B
+    write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
+    with pytest.raises(ValueError, match="already been applied"):
+        apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    # Nothing written: B is still current and was not archived with a zero-length range
+    current = spark.read.parquet(f"{current_path}/dim_customer_current").collect()
+    assert [r["annual_income"] for r in current] == [2000.0]
+    history = spark.read.parquet(f"{history_path}/dim_customer_history").collect()
+    assert [(r["annual_income"], r["record_effective_date"], r["record_end_date"]) for r in history] == \
+        [(1000.0, "2025-01-01", "2025-02-01")]
