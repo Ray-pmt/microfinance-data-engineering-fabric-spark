@@ -187,3 +187,42 @@ def overwrite_parquet(spark: SparkSession, df: DataFrame, path: str) -> int:
         fs.delete(previous, True)
 
     return spark.read.parquet(path).count()
+
+
+def _watermark_path(table_path: str) -> str:
+    return table_path.rstrip("/") + "__watermark"
+
+
+def read_watermark(spark: SparkSession, table_path: str):
+    """Latest batch date applied to the table at `table_path`, or None if none is recorded."""
+    path = _watermark_path(table_path)
+    if not path_exists(spark, path):
+        return None
+    rows = spark.read.schema("last_processed_date string").json(path).collect()
+    return max((r["last_processed_date"] for r in rows if r["last_processed_date"]), default=None)
+
+
+def write_watermark(spark: SparkSession, table_path: str, process_date: str):
+    """Record `process_date` as the latest batch applied to the table, whether or not it changed anything."""
+    spark.createDataFrame([(process_date,)], "last_processed_date string") \
+         .coalesce(1).write.mode("overwrite").json(_watermark_path(table_path))
+
+
+def check_batch_order(spark: SparkSession, table_name: str, table_path: str,
+                      effective_date: str, latest_change_date: str = None):
+    """
+    Refuse to apply a batch older than one the table already reflects.
+
+    Batches must be applied in date order: an older batch would be recorded as a change on top
+    of newer ones, with an earlier effective date. The cutoff is the latest batch applied
+    (the watermark, which also covers batches that changed nothing) or, should the watermark
+    lag behind (a crash between writing the table and the watermark), the latest change date.
+    Re-applying the latest batch date is allowed.
+    """
+    cutoff = max(filter(None, [read_watermark(spark, table_path), latest_change_date]), default=None)
+    if cutoff and effective_date < cutoff:
+        raise ValueError(
+            f"{table_name}: batches up to {cutoff} have already been applied; applying the "
+            f"{effective_date} batch now would corrupt its history. Rebuild the table by "
+            f"replaying batches in date order instead."
+        )

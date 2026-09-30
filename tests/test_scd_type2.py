@@ -178,3 +178,52 @@ def test_completed_swap_with_leftover_previous_version_keeps_new_table(spark, tm
 
     assert spark.read.parquet(table).count() == 2
     assert not (tmp_path / "dim" / "dim_customer__previous").exists()
+
+
+def test_batch_without_changes_still_blocks_an_earlier_correction(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    # February says the same thing: no change is recorded, but the batch was applied
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    # A corrected January batch must not become current on top of February's value
+    write_batch([make_row("C1", "L1", income=5000.0)], "2025-01-01")
+    with pytest.raises(ValueError, match="date order"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+
+    customers = _customers(spark, dim_path)
+    assert customers[("C1", True)]["annual_income"] == 1000.0
+
+
+def test_change_dates_still_guard_when_the_watermark_lags(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    batches = write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    # Simulate a crash after the tables were written but before their watermarks were
+    for dim_name in ("dim_customer", "dim_loan"):
+        shutil.rmtree(f"{dim_path}/{dim_name}__watermark")
+
+    with pytest.raises(ValueError, match="dim_customer.*date order"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+
+    customers = _customers(spark, dim_path)
+    assert customers[("C1", True)]["annual_income"] == 2000.0
+
+
+def test_interrupted_swap_is_recovered_even_when_the_batch_is_empty(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1")], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    table = f"{dim_path}/dim_customer"
+    shutil.move(table, table + "__previous")
+
+    # No transformed data exists for this date
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    assert spark.read.parquet(table).count() == 1
+    assert not (tmp_path / "dim" / "dim_customer__previous").exists()

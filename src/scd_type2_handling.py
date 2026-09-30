@@ -4,7 +4,7 @@ SCD Type 2 Handling Script for Microfinance Dimensions on Microsoft Fabric
 
 Features:
 - Processes one process_date batch at a time, using that date as the effective date;
-  refuses to apply a batch older than what the dimension already reflects
+  records the latest batch applied (even one with no changes) and refuses older batches
 - Reads new data once and reuses it for each dimension (improves efficiency)
 - Keeps the latest version of each business key (by last_updated) from the incoming data
 - Only keys present in the incoming data can be expired; keys absent from a batch stay current
@@ -23,7 +23,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common import (DIMENSION_CONFIGS, latest_per_key, tracked_columns_changed, path_exists,
-                    overwrite_parquet, read_batch, recover_table)
+                    overwrite_parquet, read_batch, recover_table, check_batch_order, write_watermark)
 
 # Configure logging
 logging.basicConfig(
@@ -64,6 +64,13 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
         f"dimension_path={dimension_path}, process_date={process_date}, effective_date={effective_date}"
     )
 
+    # Finish or roll back any interrupted swap first, so it isn't mistaken for a missing table.
+    # This runs even when the batch turns out to be empty.
+    for dim_name in DIMENSION_CONFIGS:
+        recover_table(spark, f"{dimension_path}/{dim_name}")
+        if output_path != dimension_path:
+            recover_table(spark, f"{output_path}/{dim_name}")
+
     # Read and cache this batch once for reuse
     new_data_full = read_batch(spark, new_data_path, process_date)
     if new_data_full is None:
@@ -85,16 +92,12 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
         dim_file_path = f"{dimension_path}/{dim_name}"
         target_path = f"{output_path}/{dim_name}"
 
-        # Finish or roll back an interrupted swap first, so it isn't mistaken for a missing table
-        recover_table(spark, dim_file_path)
-        if target_path != dim_file_path:
-            recover_table(spark, target_path)
-
         # Initial load: every key becomes the first current version
         if not path_exists(spark, dim_file_path):
             logger.info(f"{dim_name}: Dimension does not exist yet. Creating it.")
             new_dim = _add_current_versions(new_dim_data, business_keys, 0, effective_date)
             count = overwrite_parquet(spark, new_dim, target_path)
+            write_watermark(spark, target_path, effective_date)
             logger.info(f"{dim_name}: New dimension created with {count} records")
             continue
 
@@ -105,15 +108,9 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
             raise ValueError(f"{dim_name}: existing dimension at {dim_file_path} is missing columns {missing_cols}")
         dim_df = dim_df.select(*all_columns, *SCD2_COLUMNS)
 
-        # Versions must be applied in date order; an older batch would be recorded as a change
-        # after newer versions, with an effective date earlier than theirs
-        latest_effective_date = dim_df.agg(F.max("effective_start_date")).collect()[0][0]
-        if latest_effective_date and effective_date < latest_effective_date:
-            raise ValueError(
-                f"{dim_name}: already reflects changes effective {latest_effective_date}; applying the "
-                f"{effective_date} batch now would corrupt its history. Rebuild the dimension by "
-                f"replaying batches in date order instead."
-            )
+        # Batches must be applied in date order
+        latest_change_date = dim_df.agg(F.max("effective_start_date")).collect()[0][0]
+        check_batch_order(spark, dim_name, dim_file_path, effective_date, latest_change_date)
 
         current_records = dim_df.filter(F.col("is_current"))
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
@@ -133,6 +130,7 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
 
         if changed_count == 0 and new_count == 0:
             logger.info(f"{dim_name}: No changes; dimension left as is.")
+            write_watermark(spark, target_path, effective_date)
             continue
 
         # Expire the current versions of changed keys
@@ -153,6 +151,7 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
                                     .unionByName(new_versions.select(*all_columns, *SCD2_COLUMNS))
 
         final_record_count = overwrite_parquet(spark, final_dim, target_path)
+        write_watermark(spark, target_path, effective_date)
         logger.info(f"{dim_name}: Updated dimension written with {final_record_count} records")
 
     new_data_full.unpersist()

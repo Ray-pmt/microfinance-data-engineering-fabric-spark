@@ -94,9 +94,9 @@ The shell script orchestrates the pipeline components in sequence:
 
 The date is the batch's `process_date`. Every step works on that batch only:
 - Ingestion, transformation and data quality replace that date's output on a re-run, including clearing it when the re-run has no rows for it.
-- The SCD step applies only that date's transformed batch, using the date as the effective date. Dimensions must be built in date order: re-running the latest date is safe, but applying a date older than the dimension already reflects is refused, since it would corrupt the history.
+- The SCD step applies only that date's transformed batch, using the date as the effective date. Dimensions must be built in date order: each dimension records the latest batch date applied to it (in `<table>__watermark`, including batches that changed nothing). Re-running that date is safe, but applying an older date is refused, since it would corrupt the history.
 
-Any failing step exits non-zero, which stops the script. Dimension tables are replaced by writing a staging copy and swapping it in, keeping the previous version until the swap completes; the next run recovers an interrupted swap automatically.
+Any failing step exits non-zero, which stops the script. Dimension tables are replaced by writing a staging copy and swapping it in, keeping the previous version until the swap completes; the next run recovers an interrupted swap automatically, even if its batch is empty.
 
 ### Option 2: Manual Execution
 ```bash
