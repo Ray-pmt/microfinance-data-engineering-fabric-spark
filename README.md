@@ -17,7 +17,9 @@ This project demonstrates the creation and management of scalable data pipelines
 ├── .gitignore
 ├── requirements.txt
 ├── run_pipeline.sh              # Pipeline orchestration entry point
+├── pytest.ini
 ├── src                          # PySpark pipeline components
+│   ├── common.py                # Shared SCD config, dedup, change detection, safe overwrite
 │   ├── data_ingestion.py
 │   ├── data_transformation.py
 │   ├── data_quality_checks.py
@@ -27,6 +29,7 @@ This project demonstrates the creation and management of scalable data pipelines
 │   └── fabric_spark_pipeline.json   # Fabric pipeline definition
 ├── data
 │   └── sample_data.csv          # Sample input data
+├── tests                        # pytest suite (local Spark session)
 └── docs
     └── diagrams
         ├── ADF_activities_flowchart.png
@@ -43,19 +46,20 @@ This project demonstrates the creation and management of scalable data pipelines
 ## Core Capabilities
 
 ### 🔹 Ingestion
-- Ingests microfinance domain data (e.g., customer, loan transactions) from CSV into a Lakehouse table.
-- `data_ingestion.py` reads the raw CSV and writes it to a Delta table.
+- Ingests microfinance domain data (e.g., customer, loan transactions) from CSV into the Lakehouse.
+- `data_ingestion.py` reads the raw CSV with an enforced schema, routes invalid and malformed rows to an error path, and writes valid rows as Parquet partitioned by `process_date`.
+- Re-running the same `process_date` replaces that batch (dynamic partition overwrite) instead of appending a duplicate.
 
 ### 🔹 Transformation
-- `data_transformation.py` performs cleaning, formatting, and joins for loan analysis.
+- `data_transformation.py` calculates monthly payments and loan categories for a `process_date` batch, replacing that batch on re-run. A run audit log is written next to the output (`<output>_audit`).
 
 ### 🔹 Data Quality
-- `data_quality_checks.py` verifies data integrity (null checks, schema validation).
+- `data_quality_checks.py` verifies data integrity (null checks, value ranges, allowed statuses) and writes a JSON report plus the offending records.
 
 ### 🔹 SCD Type 2
-- `scd_type2_handling.py` implements production-ready SCD Type 2 for tracking historical changes to customer and loan attributes
-- Features Delta Lake integration, robust error handling, optimized performance, and comprehensive monitoring
-- Configurable through notebook parameters in Microsoft Fabric
+- `scd_type2_handling.py` implements SCD Type 2 for tracking historical changes to customer and loan attributes
+- Takes the latest version of each key (by `last_updated`), uses null-safe change detection, and only expires keys present in the incoming batch
+- Rewrites the dimension through a staging directory, so reading and replacing the same path is safe
 
 ### 🔹 SCD Type 4
 - `scd_type4_handling.py` implements the alternative history-table pattern: a compact *current* table (one row per business key) plus an append-only *history* table of superseded versions
@@ -87,15 +91,17 @@ The shell script orchestrates the pipeline components in sequence:
 ./run_pipeline.sh dev 2025-04-11 4
 ```
 
+The date is the batch's `process_date`. Re-running a date replaces that batch, and the date is also used as the SCD effective date. Any failing step exits non-zero, which stops the script.
+
 ### Option 2: Manual Execution
 ```bash
-python src/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_data fabric_ingested_data/error_data
-python src/data_quality_checks.py fabric_ingested_data/parquet_data fabric_data_quality_report.json
-python src/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data
-python src/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data
+python src/data_ingestion.py data/sample_data.csv fabric_ingested_data/parquet_data fabric_ingested_data/error_data 2025-04-11
+python src/data_quality_checks.py fabric_ingested_data/parquet_data fabric_reports/quality_report.json 2025-04-11
+python src/data_transformation.py fabric_ingested_data/parquet_data fabric_transformed_data/parquet_data 2025-04-11
+python src/scd_type2_handling.py fabric_transformed_data/parquet_data fabric_dim_data fabric_dim_data 2025-04-11
 
 # Or SCD Type 4 (writes dim_*_current and dim_*_history tables)
-python src/scd_type4_handling.py fabric_transformed_data/parquet_data fabric_dim_data/current fabric_dim_data/history
+python src/scd_type4_handling.py fabric_transformed_data/parquet_data fabric_dim_data/current fabric_dim_data/history 2025-04-11
 ```
 
 ### Option 3: Microsoft Fabric Execution
@@ -109,11 +115,17 @@ python src/scd_type4_handling.py fabric_transformed_data/parquet_data fabric_dim
 - Configure environment-specific parameters through Fabric's interface
 
 ## Development and Testing
-- Use shell scripts for local development and testing
-- Run tests locally before deploying to Fabric
+The test suite runs every step against a local Spark session (Java 17+ required):
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+The tests cover schema enforcement and error routing, re-run idempotency, failure propagation, and the SCD Type 2 / Type 4 cases that matter (changed, new, and absent keys; latest-version-wins; null-to-value changes).
 
 ## Outcome
 - Version-controlled, production-ready PySpark pipelines for microfinance analytics
-- Robust SCD Type 2 implementation with Delta Lake for ACID transactions
+- Tested SCD Type 2 and Type 4 implementations
 - Compatible with Microsoft Fabric's Lakehouse environment
 - Pipeline orchestration using both Fabric's native tools and custom shell scripts
