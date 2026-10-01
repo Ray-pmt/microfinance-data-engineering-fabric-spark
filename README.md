@@ -94,7 +94,7 @@ The shell script orchestrates the pipeline components in sequence:
 
 The date is the batch's `process_date`. Every step works on that batch only:
 - Ingestion, transformation and data quality replace that date's output on a re-run, including clearing it when the re-run has no rows for it.
-- The SCD step applies only that date's transformed batch, using the date as the effective date. Dimensions must be built in date order: each dimension records the latest batch date applied to it (in `<table>__watermark`, including batches that changed nothing). Re-running that date is safe as long as it changes nothing (e.g. a retry after a failure); applying an older date, or re-running the latest date with different data, is refused, since either would corrupt the history.
+- The SCD step applies only that date's transformed batch, using the date as the effective date. Dimensions must be built in date order: before changing a dimension, the step records the batch date and a fingerprint of the batch's rows in `<table>__watermark` (including batches that change nothing). Re-running that date with identical data is safe (e.g. a retry after a failure). Applying an older date is refused, and so is re-running the latest date with different data (rows added, changed, removed, or an empty batch) once any of that date's changes are in the table, since either would corrupt the history.
 
 Any failing step exits non-zero, which stops the script. Dimension tables are replaced by writing a staging copy and swapping it in, keeping the previous version until the swap completes; the next run recovers an interrupted swap automatically, even if its batch is empty.
 
@@ -141,7 +141,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-The tests cover schema enforcement and error routing, re-run idempotency, failure propagation, and the SCD Type 2 / Type 4 cases that matter (changed, new, and absent keys; latest-version-wins; null-to-value changes; one batch per date, date-order enforcement and refusal of changed re-runs; recovery from an interrupted table swap or a failed run).
+The tests cover schema enforcement and error routing, re-run idempotency, failure propagation, and the SCD Type 2 / Type 4 cases that matter (changed, new, and absent keys; latest-version-wins; null-to-value changes; one batch per date, date-order enforcement and refusal of re-runs with different data, including removed rows and emptied batches; recovery from an interrupted table swap or a failed run).
 
 ## Outcome
 - Version-controlled, production-ready PySpark pipelines for microfinance analytics

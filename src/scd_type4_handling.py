@@ -14,7 +14,7 @@ effective dates and is_current flags) so the pipeline demonstrates both patterns
 Features:
 - Processes one process_date batch at a time, using that date as the effective date;
   records the latest batch applied (even one with no changes) and refuses older batches;
-  a re-run of the latest batch is allowed only if it changes nothing (corrections need a replay)
+  the latest batch may be re-run only with identical data (corrections need a replay)
 - Reads new data once and reuses it for each dimension (improves efficiency)
 - Config-driven dimensions sharing the same business keys / tracked columns as SCD Type 2
 - Keeps the latest version of each business key (by last_updated) from the incoming data
@@ -33,7 +33,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from common import (DIMENSION_CONFIGS, latest_per_key, tracked_columns_changed, path_exists,
-                    overwrite_parquet, read_batch, recover_table, check_batch_order, check_rerun_unchanged,
+                    overwrite_parquet, read_batch, recover_table, batch_fingerprint, check_batch,
                     write_watermark)
 
 # Configure logging
@@ -68,13 +68,14 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
     for dim_name in DIMENSION_CONFIGS:
         recover_table(spark, f"{current_path}/{dim_name}_current")
 
-    # Read and cache this batch once for reuse
+    # Read and cache this batch once for reuse. An empty batch still goes through the checks
+    # below: a re-run that empties an already-applied batch must be refused, not ignored.
     new_data_full = read_batch(spark, new_data_path, process_date)
     if new_data_full is None:
-        logger.info(f"No transformed data for process_date={process_date}; tables left as is.")
-        return
-    new_data_full = new_data_full.cache()
-    logger.info(f"Loaded new data with {new_data_full.count()} records")
+        logger.info(f"No transformed data for process_date={process_date}.")
+    else:
+        new_data_full = new_data_full.cache()
+        logger.info(f"Loaded new data with {new_data_full.count()} records")
 
     for dim_name, config in DIMENSION_CONFIGS.items():
         logger.info(f"Processing dimension: {dim_name}")
@@ -83,8 +84,11 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         all_columns = business_keys + tracked_columns
 
         # Latest version of each business key in the incoming data
-        new_dim_data = latest_per_key(new_data_full, business_keys).select(*all_columns)
-        logger.info(f"{dim_name}: {new_dim_data.count()} records loaded from new data")
+        new_dim_data = None
+        if new_data_full is not None:
+            new_dim_data = latest_per_key(new_data_full, business_keys).select(*all_columns).cache()
+        fingerprint = batch_fingerprint(new_dim_data, all_columns)
+        logger.info(f"{dim_name}: batch fingerprint {fingerprint} (rows:sum of row hashes)")
 
         current_table_path = f"{current_path}/{dim_name}_current"
         history_table_path = f"{history_path}/{dim_name}_history"
@@ -92,10 +96,13 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         # Initial load: write the current table; the history table starts empty and
         # only receives rows once versions are superseded
         if not path_exists(spark, current_table_path):
+            if new_dim_data is None:
+                logger.info(f"{dim_name}: No data and no current table yet; nothing to do.")
+                continue
             logger.info(f"{dim_name}: Current table does not exist yet. Creating it.")
+            write_watermark(spark, current_table_path, effective_date, fingerprint)
             initial_current = new_dim_data.withColumn("record_effective_date", F.lit(effective_date))
             count = overwrite_parquet(spark, initial_current, current_table_path)
-            write_watermark(spark, current_table_path, effective_date)
             logger.info(f"{dim_name}: Current table created with {count} records")
             continue
 
@@ -106,9 +113,24 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
             raise ValueError(f"{dim_name}: existing current table at {current_table_path} is missing columns {missing_cols}")
         current_df = current_df.select(*all_columns, "record_effective_date")
 
-        # Batches must be applied in date order
+        # Batches must be applied in date order, and an applied batch can only be re-run unchanged.
+        # This date's changes may be in the current table, or only in history if a run stopped
+        # between archiving and replacing the current table.
+        def batch_effects_written():
+            if current_df.filter(F.col("record_effective_date") == effective_date).limit(1).count() > 0:
+                return True
+            return path_exists(spark, history_table_path) and spark.read.parquet(history_table_path) \
+                .filter(F.col("record_end_date") == effective_date).limit(1).count() > 0
+
         latest_change_date = current_df.agg(F.max("record_effective_date")).collect()[0][0]
-        cutoff = check_batch_order(spark, dim_name, current_table_path, effective_date, latest_change_date)
+        check_batch(spark, dim_name, current_table_path, effective_date, fingerprint, latest_change_date,
+                    batch_effects_written)
+        if new_dim_data is None:
+            logger.info(f"{dim_name}: Empty batch; tables left as is.")
+            continue
+
+        # Record the batch before changing the tables, so the record never lags behind them
+        write_watermark(spark, current_table_path, effective_date, fingerprint)
 
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
 
@@ -123,11 +145,9 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         changed_count = changed_records.count()
         new_count = new_records.count()
         logger.info(f"{dim_name}: Found {changed_count} changed records and {new_count} new records.")
-        check_rerun_unchanged(dim_name, effective_date, cutoff, changed_count + new_count)
 
         if changed_count == 0 and new_count == 0:
             logger.info(f"{dim_name}: No changes; tables left as is.")
-            write_watermark(spark, current_table_path, effective_date)
             continue
 
         # Archive superseded versions into the append-only history table. History is appended
@@ -167,10 +187,10 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
 
         # Write the rebuilt current table (exactly one row per business key)
         final_record_count = overwrite_parquet(spark, updated_current, current_table_path)
-        write_watermark(spark, current_table_path, effective_date)
         logger.info(f"{dim_name}: Current table written with {final_record_count} records")
 
-    new_data_full.unpersist()
+    if new_data_full is not None:
+        new_data_full.unpersist()
     logger.info("SCD Type 4 processing completed successfully")
 
 

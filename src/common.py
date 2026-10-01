@@ -193,55 +193,77 @@ def _watermark_path(table_path: str) -> str:
     return table_path.rstrip("/") + "__watermark"
 
 
+def batch_fingerprint(df: DataFrame, columns) -> str:
+    """
+    Order-independent fingerprint of the rows a batch contributes to a dimension: the row count
+    plus the sum of per-row hashes. Any added, removed or changed row changes it. An empty
+    batch (df is None) has the fingerprint "0:0".
+    """
+    if df is None:
+        return "0:0"
+    # Hash the JSON form so nulls in different columns can't collide (Spark's hash skips nulls)
+    row_hash = F.xxhash64(F.to_json(F.struct(*columns))).cast("decimal(38,0)")
+    totals = df.agg(F.count(F.lit(1)).alias("n"), F.sum(row_hash).alias("s")).first()
+    return f"{totals['n']}:{totals['s'] or 0}"
+
+
 def read_watermark(spark: SparkSession, table_path: str):
-    """Latest batch date applied to the table at `table_path`, or None if none is recorded."""
+    """
+    The latest batch recorded for the table at `table_path`, as (process_date, fingerprint),
+    or (None, None) if none is recorded.
+    """
     path = _watermark_path(table_path)
+    recover_table(spark, path)
     if not path_exists(spark, path):
-        return None
-    rows = spark.read.schema("last_processed_date string").json(path).collect()
-    return max((r["last_processed_date"] for r in rows if r["last_processed_date"]), default=None)
+        return None, None
+    row = spark.read.parquet(path).first()
+    return (row["last_processed_date"], row["batch_fingerprint"]) if row else (None, None)
 
 
-def write_watermark(spark: SparkSession, table_path: str, process_date: str):
-    """Record `process_date` as the latest batch applied to the table, whether or not it changed anything."""
-    spark.createDataFrame([(process_date,)], "last_processed_date string") \
-         .coalesce(1).write.mode("overwrite").json(_watermark_path(table_path))
-
-
-def check_batch_order(spark: SparkSession, table_name: str, table_path: str,
-                      effective_date: str, latest_change_date: str = None):
+def write_watermark(spark: SparkSession, table_path: str, process_date: str, fingerprint: str):
     """
-    Refuse to apply a batch older than one the table already reflects.
+    Record that the batch for `process_date` (with `fingerprint`) is being applied to the table.
 
-    Batches must be applied in date order: an older batch would be recorded as a change on top
-    of newer ones, with an earlier effective date. The cutoff is the latest batch applied
-    (the watermark, which also covers batches that changed nothing) or, should the watermark
-    lag behind (a crash between writing the table and the watermark), the latest change date.
-    Re-applying the latest batch date is allowed (see `check_rerun_unchanged`).
-
-    Returns the cutoff date (None when nothing has been applied yet).
+    Written *before* the table itself, so the record never lags behind the table: a batch whose
+    changes are (partly) in the table is always the recorded one. Uses the same safe swap as the
+    tables, so a crash can't lose the previous record.
     """
-    cutoff = max(filter(None, [read_watermark(spark, table_path), latest_change_date]), default=None)
-    if cutoff and effective_date < cutoff:
+    df = spark.createDataFrame([(process_date, fingerprint)],
+                               "last_processed_date string, batch_fingerprint string")
+    overwrite_parquet(spark, df, _watermark_path(table_path))
+
+
+def check_batch(spark: SparkSession, table_name: str, table_path: str, effective_date: str,
+                fingerprint: str, latest_change_date, batch_effects_written):
+    """
+    Refuse to apply a batch that would corrupt the table's history.
+
+    The cutoff is the latest batch date recorded in the watermark (which also covers batches that
+    changed nothing) or, if the watermark is missing, the latest change date found in the table.
+
+    - An older batch date is refused: it would be recorded as a change on top of newer ones.
+    - The cutoff date itself may be re-run with the same batch (fingerprint unchanged): that is a
+      retry, which either finishes an interrupted run or changes nothing.
+    - A different batch for the cutoff date (rows added, changed or removed, or none at all) is
+      refused once any of that date's changes are in the table: they can't be undone in place.
+      `batch_effects_written` is a callable that checks for rows stamped with the date.
+    """
+    recorded_date, recorded_fingerprint = read_watermark(spark, table_path)
+    cutoff = max(filter(None, [recorded_date, latest_change_date]), default=None)
+    if not cutoff or effective_date > cutoff:
+        return
+
+    if effective_date < cutoff:
         raise ValueError(
             f"{table_name}: batches up to {cutoff} have already been applied; applying the "
             f"{effective_date} batch now would corrupt its history. Rebuild the table by "
             f"replaying batches in date order instead."
         )
-    return cutoff
 
-
-def check_rerun_unchanged(table_name: str, effective_date: str, cutoff: str, change_count: int):
-    """
-    Refuse a re-run of the latest applied batch date when it would change the table.
-
-    A re-run that matches what was applied (e.g. a retry after a crash) is a no-op and is allowed.
-    A re-run with corrected data would be recorded as a second change on the same date: a version
-    that starts and ends on that date. Corrections to an applied batch need a replay instead.
-    """
-    if cutoff and effective_date == cutoff and change_count > 0:
+    same_batch = recorded_date == effective_date and recorded_fingerprint == fingerprint
+    if not same_batch and batch_effects_written():
         raise ValueError(
-            f"{table_name}: the {effective_date} batch has already been applied and this re-run would "
-            f"change {change_count} record(s). Applied batches can't be corrected in place; replay the "
+            f"{table_name}: the {effective_date} batch has already been applied and this re-run "
+            f"contains different data. Applied batches can't be corrected in place; replay the "
             f"table: delete it and its __watermark, then run each batch date in order."
         )

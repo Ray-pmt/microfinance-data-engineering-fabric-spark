@@ -143,7 +143,7 @@ def test_corrected_rerun_of_the_latest_date_is_refused(spark, tmp_path, write_ba
 
     # February's batch is corrected: C instead of B
     write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
-    with pytest.raises(ValueError, match="already been applied"):
+    with pytest.raises(ValueError, match="different data"):
         apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
 
     # Nothing written: B is still current and was not archived with a zero-length range
@@ -152,3 +152,53 @@ def test_corrected_rerun_of_the_latest_date_is_refused(spark, tmp_path, write_ba
     history = spark.read.parquet(f"{history_path}/dim_customer_history").collect()
     assert [(r["annual_income"], r["record_effective_date"], r["record_end_date"]) for r in history] == \
         [(1000.0, "2025-01-01", "2025-02-01")]
+
+
+def test_rerun_that_removes_a_key_is_refused(spark, tmp_path, transformed_path, write_batch, make_row):
+    current_path, history_path = str(tmp_path / "current"), str(tmp_path / "history")
+    batches = write_batch([make_row("C1", "L1")], "2025-01-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-01-01")
+    # February introduces C2
+    write_batch([make_row("C1", "L1"), make_row("C2", "L2")], "2025-02-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    # Corrected February batch without C2
+    write_batch([make_row("C1", "L1")], "2025-02-01")
+    with pytest.raises(ValueError, match="different data"):
+        apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    # Corrected February batch that is empty altogether
+    shutil.rmtree(f"{transformed_path}/process_date=2025-02-01")
+    with pytest.raises(ValueError, match="different data"):
+        apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    current = spark.read.parquet(f"{current_path}/dim_customer_current").collect()
+    assert sorted(r["customer_id"] for r in current) == ["C1", "C2"]
+
+
+def test_corrected_rerun_after_archiving_only_is_refused(
+        spark, tmp_path, write_batch, make_row, monkeypatch):
+    current_path, history_path = str(tmp_path / "current"), str(tmp_path / "history")
+    batches = write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-01-01")
+    write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+
+    # February archives C1's January version, then fails before replacing the current table
+    def failing_overwrite(*args, **kwargs):
+        raise IOError("simulated failure while replacing the current table")
+    monkeypatch.setattr(scd_type4_handling, "overwrite_parquet", failing_overwrite)
+    with pytest.raises(IOError):
+        apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+    monkeypatch.undo()
+
+    # A corrected batch can't be applied on top of that half-applied state...
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-02-01")
+    with pytest.raises(ValueError, match="different data"):
+        apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+
+    # ...but the original batch can still be retried to completion
+    write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type4(spark, batches, current_path, history_path, process_date="2025-02-01")
+    current = spark.read.parquet(f"{current_path}/dim_customer_current").collect()
+    assert [r["annual_income"] for r in current] == [2000.0]
+    assert spark.read.parquet(f"{history_path}/dim_customer_history").count() == 1

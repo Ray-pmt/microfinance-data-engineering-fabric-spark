@@ -1,6 +1,8 @@
 import shutil
 
 import pytest
+
+import scd_type2_handling
 from pyspark.sql import functions as F
 
 from scd_type2_handling import apply_scd_type2
@@ -204,7 +206,7 @@ def test_change_dates_still_guard_when_the_watermark_lags(spark, tmp_path, write
     apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
     apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
 
-    # Simulate a crash after the tables were written but before their watermarks were
+    # If the watermarks are lost, the change dates in the table still enforce the order
     for dim_name in ("dim_customer", "dim_loan"):
         shutil.rmtree(f"{dim_path}/{dim_name}__watermark")
 
@@ -239,7 +241,7 @@ def test_corrected_rerun_of_the_latest_date_is_refused(spark, tmp_path, write_ba
 
     # February's batch is corrected: C instead of B
     write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
-    with pytest.raises(ValueError, match="already been applied"):
+    with pytest.raises(ValueError, match="different data"):
         apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
 
     # Nothing written: no version that starts and ends on 2025-02-01
@@ -253,7 +255,7 @@ def test_rerun_of_the_latest_date_that_adds_a_key_is_refused(spark, tmp_path, wr
     apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
 
     write_batch([make_row("C1", "L1"), make_row("C2", "L2")], "2025-01-01")
-    with pytest.raises(ValueError, match="already been applied"):
+    with pytest.raises(ValueError, match="different data"):
         apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
 
     assert spark.read.parquet(f"{dim_path}/dim_customer").count() == 1
@@ -279,4 +281,69 @@ def test_replay_applies_a_corrected_batch(spark, tmp_path, write_batch, make_row
     assert customers[("C1", False)]["annual_income"] == 1000.0
     assert customers[("C1", False)]["effective_end_date"] == "2025-02-01"
     assert customers[("C1", True)]["annual_income"] == 3000.0
+    assert customers[("C1", True)]["effective_start_date"] == "2025-02-01"
+
+
+def test_rerun_that_removes_a_key_is_refused(spark, tmp_path, transformed_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1")], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    # February introduces C2
+    write_batch([make_row("C1", "L1"), make_row("C2", "L2")], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+    before = sorted(tuple(r) for r in spark.read.parquet(f"{dim_path}/dim_customer").collect())
+
+    # Corrected February batch without C2
+    write_batch([make_row("C1", "L1")], "2025-02-01")
+    with pytest.raises(ValueError, match="different data"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    # Corrected February batch that is empty altogether
+    shutil.rmtree(f"{transformed_path}/process_date=2025-02-01")
+    with pytest.raises(ValueError, match="different data"):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    after = sorted(tuple(r) for r in spark.read.parquet(f"{dim_path}/dim_customer").collect())
+    assert before == after
+
+
+def test_corrected_rerun_after_a_failed_write_is_applied(
+        spark, tmp_path, write_batch, make_row, monkeypatch):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    write_batch([make_row("C1", "L1", income=2000.0), make_row("C2", "L2")], "2025-02-01")
+
+    # February's run records the batch but fails before changing the dimension
+    def failing_overwrite(*args, **kwargs):
+        raise IOError("simulated failure while replacing the dimension")
+    monkeypatch.setattr(scd_type2_handling, "overwrite_parquet", failing_overwrite)
+    with pytest.raises(IOError):
+        apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+    monkeypatch.undo()
+
+    # Nothing of February is in the table, so a corrected batch can still be applied
+    write_batch([make_row("C1", "L1", income=3000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    customers = _customers(spark, dim_path)
+    assert sorted(customers) == [("C1", False), ("C1", True)]
+    assert customers[("C1", False)]["effective_end_date"] == "2025-02-01"
+    assert customers[("C1", True)]["annual_income"] == 3000.0
+
+
+def test_batch_that_changed_nothing_can_be_corrected(spark, tmp_path, write_batch, make_row):
+    dim_path = str(tmp_path / "dim")
+    batches = write_batch([make_row("C1", "L1", income=1000.0)], "2025-01-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-01-01")
+    write_batch([make_row("C1", "L1", income=1000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    # February changed nothing, so the dimension is still in its January state
+    write_batch([make_row("C1", "L1", income=2000.0)], "2025-02-01")
+    apply_scd_type2(spark, batches, dim_path, dim_path, process_date="2025-02-01")
+
+    customers = _customers(spark, dim_path)
+    assert customers[("C1", False)]["effective_end_date"] == "2025-02-01"
+    assert customers[("C1", True)]["annual_income"] == 2000.0
     assert customers[("C1", True)]["effective_start_date"] == "2025-02-01"
