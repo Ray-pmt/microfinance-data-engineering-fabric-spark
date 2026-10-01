@@ -5,17 +5,20 @@ A streamlined data transformation script for a microfinance company on Microsoft
 Features:
 - Calculation of monthly loan payments using standard amortization formula
 - Categorization of loans based on amount
-- Basic error handling and logging
-- Partitioned output for optimized queries
+- Idempotent writes: each run replaces only the process_date partitions it transforms,
+  including clearing a batch that has become empty
+- Audit log kept outside the data directory so it never breaks reads of the table
+- Failures propagate (non-zero exit) so the orchestrator can see them
 """
 
 import sys
 import logging
-import math
 import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
+
+from common import read_batch, write_batch_partition
 
 # Configure minimal logging (Fabric provides integrated monitoring)
 logging.basicConfig(
@@ -49,70 +52,92 @@ def compute_monthly_payment(loan_amount, interest_rate, term_months):
 # Register the UDF
 compute_monthly_payment_udf = F.udf(compute_monthly_payment, DoubleType())
 
-def transform_data(input_path: str, output_path: str, partition_by: str = "application_date"):
-    logger.info(f"Starting data transformation from {input_path} to {output_path}")
 
+def audit_log_path(output_path: str) -> str:
+    """Audit log lives next to (not inside) the output table."""
+    return output_path.rstrip("/") + "_audit"
+
+
+def transform_data(spark, input_path: str, output_path: str, process_date: str = None) -> int:
+    """
+    Transform ingested data. When `process_date` is given only that batch is transformed;
+    otherwise every ingested batch is (re)transformed.
+
+    Returns the number of records transformed.
+    """
+    logger.info(f"Starting data transformation from {input_path} to {output_path} (process_date={process_date})")
+
+    # Read the ingested data (Parquet, partitioned by process_date)
+    df = read_batch(spark, input_path, process_date)
+    total_records = df.count() if df is not None else 0
+    logger.info(f"Loaded {total_records} records from {input_path}")
+
+    if total_records == 0:
+        if process_date:
+            logger.info(f"No data for {process_date}; clearing any previous output for it.")
+            write_batch_partition(spark, None, 0, output_path, process_date)
+        else:
+            logger.info("No data to transform. Exiting.")
+        return 0
+
+    # Calculate monthly payment and add as a new column.
+    # Assumes columns: loan_amount, interest_rate, term_months exist.
+    df = df.withColumn(
+        "monthly_payment",
+        compute_monthly_payment_udf(F.col("loan_amount"), F.col("interest_rate"), F.col("term_months"))
+    )
+
+    # Categorize loans based on amount.
+    # Example thresholds: Small (<5000), Medium (5000-20000), Large (>20000)
+    df = df.withColumn(
+        "loan_category",
+        F.when(F.col("loan_amount") < 5000, "Small")
+         .when((F.col("loan_amount") >= 5000) & (F.col("loan_amount") <= 20000), "Medium")
+         .otherwise("Large")
+    )
+
+    # Add a transformation timestamp column
+    df = df.withColumn("transformation_timestamp", F.current_timestamp())
+
+    # Replace only the process_date partitions present in this run, so re-runs don't duplicate rows
+    logger.info("Writing transformed data.")
+    write_batch_partition(spark, df, total_records, output_path, process_date)
+
+    # Append a record of this run to the audit log.
+    audit_data = {
+        "transformation_timestamp": datetime.datetime.now().isoformat(),
+        "input_path": input_path,
+        "output_path": output_path,
+        "process_date": process_date or "all",
+        "record_count": total_records
+    }
+    audit_path = audit_log_path(output_path)
+    spark.createDataFrame([audit_data]).coalesce(1).write.mode("append").json(audit_path)
+    logger.info(f"Audit log saved to {audit_path}")
+
+    logger.info("Data transformation completed successfully.")
+    return total_records
+
+
+def main(input_path: str, output_path: str, process_date: str = None):
     # Build Spark session (Fabric auto-configures the environment)
     spark = SparkSession.builder.appName("MicrofinanceDataTransformation").getOrCreate()
-    
+
     try:
-        # Read the ingested data (assumed to be in Parquet format)
-        df = spark.read.parquet(input_path)
-        total_records = df.count()
-        logger.info(f"Loaded {total_records} records from {input_path}")
-
-        if total_records == 0:
-            logger.info("No data to transform. Exiting.")
-            return
-
-        # Calculate monthly payment and add as a new column.
-        # Assumes columns: loan_amount, interest_rate, term_months exist.
-        df = df.withColumn(
-            "monthly_payment",
-            compute_monthly_payment_udf(F.col("loan_amount"), F.col("interest_rate"), F.col("term_months"))
-        )
-
-        # Categorize loans based on amount.
-        # Example thresholds: Small (<5000), Medium (5000-20000), Large (>20000)
-        df = df.withColumn(
-            "loan_category",
-            F.when(F.col("loan_amount") < 5000, "Small")
-             .when((F.col("loan_amount") >= 5000) & (F.col("loan_amount") <= 20000), "Medium")
-             .otherwise("Large")
-        )
-
-        # Add a transformation timestamp column
-        df = df.withColumn("transformation_timestamp", F.current_timestamp())
-
-        # Write transformed data partitioned by the given column for query efficiency.
-        logger.info("Writing transformed data.")
-        df.write.partitionBy(partition_by).mode("append").parquet(output_path)
-
-        # Optionally, write a simple audit log as a JSON file.
-        audit_data = {
-            "transformation_timestamp": datetime.datetime.now().isoformat(),
-            "input_path": input_path,
-            "output_path": output_path,
-            "record_count": total_records
-        }
-        audit_path = output_path + "/audit_log.json"
-        spark.createDataFrame([audit_data]).coalesce(1).write.mode("append").json(audit_path)
-        logger.info(f"Audit log saved to {audit_path}")
-
-        logger.info("Data transformation completed successfully.")
-
+        transform_data(spark, input_path, output_path, process_date)
     except Exception as e:
         logger.error(f"Transformation failed: {e}", exc_info=True)
+        raise
     finally:
         spark.stop()
         logger.info("Spark session stopped.")
 
+
 if __name__ == "__main__":
-    # Command-line overrides for input/output paths and partition column
-    # Usage: python data_transformation.py [input_path] [output_path] [partition_by]
+    # Usage: python data_transformation.py [input_path] [output_path] [process_date]
     args = sys.argv[1:]
     input_path = args[0] if len(args) > 0 else "fabric_ingested_data/parquet_data"
     output_path = args[1] if len(args) > 1 else "fabric_transformed_data/parquet_data"
-    partition_by = args[2] if len(args) > 2 else "application_date"
+    process_date = args[2] if len(args) > 2 else None
 
-    transform_data(input_path, output_path, partition_by)
+    main(input_path, output_path, process_date)
