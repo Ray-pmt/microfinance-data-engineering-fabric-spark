@@ -1,7 +1,7 @@
 {
   "name": "MicrofinanceIncrementalPipeline",
   "properties": {
-    "description": "End-to-end incremental data pipeline for microfinance data processing",
+    "description": "Illustrative Fabric-style orchestration template for a process_date batch of the PySpark Parquet portfolio pipeline",
     "activities": [
       {
         "name": "GetWatermark",
@@ -100,16 +100,9 @@
               }
             },
             {
-              "name": "incremental_mode",
+              "name": "process_date",
               "value": {
-                "value": "true",
-                "type": "Expression"
-              }
-            },
-            {
-              "name": "last_processed_date",
-              "value": {
-                "value": "@variables('lastProcessedDate')",
+                "value": "@pipeline().parameters.processDate",
                 "type": "Expression"
               }
             }
@@ -148,30 +141,23 @@
           "entryFilePath": "data_transformation.py",
           "arguments": [
             {
-              "name": "input_base_path",
+              "name": "input_path",
               "value": {
                 "value": "@pipeline().parameters.ingestedDataPath",
                 "type": "Expression"
               }
             },
             {
-              "name": "output_base_path",
+              "name": "output_path",
               "value": {
                 "value": "@pipeline().parameters.transformedDataPath",
                 "type": "Expression"
               }
             },
             {
-              "name": "incremental_mode",
+              "name": "process_date",
               "value": {
-                "value": "true",
-                "type": "Expression"
-              }
-            },
-            {
-              "name": "last_processed_date",
-              "value": {
-                "value": "@variables('lastProcessedDate')",
+                "value": "@pipeline().parameters.processDate",
                 "type": "Expression"
               }
             }
@@ -217,9 +203,16 @@
               }
             },
             {
-              "name": "output_path",
+              "name": "output_report",
               "value": {
                 "value": "@pipeline().parameters.reportsPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "process_date",
+              "value": {
+                "value": "@pipeline().parameters.processDate",
                 "type": "Expression"
               }
             }
@@ -275,6 +268,13 @@
               "name": "output_path",
               "value": {
                 "value": "@pipeline().parameters.dimensionDataPath",
+                "type": "Expression"
+              }
+            },
+            {
+              "name": "process_date",
+              "value": {
+                "value": "@pipeline().parameters.processDate",
                 "type": "Expression"
               }
             }
@@ -372,7 +372,7 @@
             "type": "DatasetReference",
             "parameters": {
               "lastProcessedDate": {
-                "value": "@utcnow()",
+                "value": "@pipeline().parameters.processDate",
                 "type": "Expression"
               }
             }
@@ -393,6 +393,10 @@
       }
     },
     "parameters": {
+      "processDate": {
+        "type": "String",
+        "defaultValue": "2025-04-11"
+      },
       "inputPath": {
         "type": "String",
         "defaultValue": "Files/raw_data/sample_data.csv"
@@ -415,15 +419,11 @@
       },
       "reportsPath": {
         "type": "String",
-        "defaultValue": "Files/reports"
+        "defaultValue": "Files/reports/quality_report.json"
       },
       "watermarkPath": {
         "type": "String",
         "defaultValue": "Files/watermarks"
-      },
-      "incrementalLoad": {
-        "type": "Bool",
-        "defaultValue": true
       }
     },
     "triggers": [

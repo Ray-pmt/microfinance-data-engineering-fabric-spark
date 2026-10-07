@@ -96,11 +96,14 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         # Initial load: write the current table; the history table starts empty and
         # only receives rows once versions are superseded
         if not path_exists(spark, current_table_path):
+            # An earlier empty batch can have a watermark even before a table exists.
+            check_batch(spark, dim_name, current_table_path, effective_date, fingerprint, None,
+                        batch_effects_written=lambda: False)
+            write_watermark(spark, current_table_path, effective_date, fingerprint)
             if new_dim_data is None:
                 logger.info(f"{dim_name}: No data and no current table yet; nothing to do.")
                 continue
             logger.info(f"{dim_name}: Current table does not exist yet. Creating it.")
-            write_watermark(spark, current_table_path, effective_date, fingerprint)
             initial_current = new_dim_data.withColumn("record_effective_date", F.lit(effective_date))
             count = overwrite_parquet(spark, initial_current, current_table_path)
             logger.info(f"{dim_name}: Current table created with {count} records")
@@ -125,12 +128,12 @@ def apply_scd_type4(spark, new_data_path, current_path, history_path, process_da
         latest_change_date = current_df.agg(F.max("record_effective_date")).collect()[0][0]
         check_batch(spark, dim_name, current_table_path, effective_date, fingerprint, latest_change_date,
                     batch_effects_written)
+
+        # Record every accepted batch, including empty ones, before changing the tables.
+        write_watermark(spark, current_table_path, effective_date, fingerprint)
         if new_dim_data is None:
             logger.info(f"{dim_name}: Empty batch; tables left as is.")
             continue
-
-        # Record the batch before changing the tables, so the record never lags behind them
-        write_watermark(spark, current_table_path, effective_date, fingerprint)
 
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
 

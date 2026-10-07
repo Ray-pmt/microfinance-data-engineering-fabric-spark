@@ -100,11 +100,14 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
 
         # Initial load: every key becomes the first current version
         if not path_exists(spark, dim_file_path):
+            # An earlier empty batch can have a watermark even before a table exists.
+            check_batch(spark, dim_name, target_path, effective_date, fingerprint, None,
+                        batch_effects_written=lambda: False)
+            write_watermark(spark, target_path, effective_date, fingerprint)
             if new_dim_data is None:
                 logger.info(f"{dim_name}: No data and no dimension yet; nothing to do.")
                 continue
             logger.info(f"{dim_name}: Dimension does not exist yet. Creating it.")
-            write_watermark(spark, target_path, effective_date, fingerprint)
             new_dim = _add_current_versions(new_dim_data, business_keys, 0, effective_date)
             count = overwrite_parquet(spark, new_dim, target_path)
             logger.info(f"{dim_name}: New dimension created with {count} records")
@@ -125,12 +128,12 @@ def apply_scd_type2(spark, new_data_path, dimension_path, output_path, process_d
                 (F.col("effective_start_date") == effective_date) | (F.col("effective_end_date") == effective_date)
             ).limit(1).count() > 0,
         )
+
+        # Record every accepted batch, including empty ones, before changing the table.
+        write_watermark(spark, target_path, effective_date, fingerprint)
         if new_dim_data is None:
             logger.info(f"{dim_name}: Empty batch; dimension left as is.")
             continue
-
-        # Record the batch before changing the table, so the record never lags behind it
-        write_watermark(spark, target_path, effective_date, fingerprint)
 
         current_records = dim_df.filter(F.col("is_current"))
         join_condition = [F.col(f"new.{key}") == F.col(f"current.{key}") for key in business_keys]
