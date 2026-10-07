@@ -4,9 +4,19 @@
 
 This portfolio project demonstrates a tested local PySpark pipeline for microfinance data: customer and loan ingestion, data quality checks, payment calculations, and SCD Type 2 / Type 4 history management. The implementation stores data as Parquet and includes a Fabric-style orchestration reference for adapting the workflow to a Microsoft Fabric workspace. Fabric deployment has not been validated.
 
+## What This Project Demonstrates
+
+- **Batch pipeline design in PySpark**: ingestion with an enforced schema, invalid and malformed rows routed to an error table, a data quality report, and loan transformations (amortized monthly payment, loan size category).
+- **Slowly changing dimensions, two ways**: SCD Type 2 (versioned rows with effective dates) and SCD Type 4 (current table plus history table), built on the same change detection so the trade-offs can be compared directly.
+- **Safe re-runs**: every step processes one `process_date` batch and replaces only that batch's output, so re-running a date never duplicates data.
+- **History protection**: batches must be applied in date order, an already-applied batch can only be re-run with identical data, and dimension tables are replaced through a staging copy that is recovered automatically if a run is interrupted.
+- **Testing**: 45 pytest tests on a local Spark session, covering normal runs, re-runs, empty batches, and failure and crash scenarios.
+
 ## Pipeline Architecture
 
 ![Pipeline activities flowchart](docs/diagrams/ADF_activities_flowchart.png)
+
+*Activities of the Fabric-style orchestration reference (`config/fabric_spark_pipeline.json`). The local `run_pipeline.sh` runs the same steps, with data quality checks before the transformation.*
 
 ## Project Structure
 
